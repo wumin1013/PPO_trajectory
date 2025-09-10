@@ -222,6 +222,12 @@ class Env:
         
         self.last_progress = 0.0
         
+        # 闭合路径累积进度跟踪变量
+        self.completed_laps = 0  # 已完成的圈数
+        self.cumulative_progress = 0.0  # 累积进度（可超过1.0）
+        self.local_progress = 0.0  # 当前圈内的本地进度
+        self.path_completed = False  # 是否已完成路径
+        
         # 添加新属性用于跟踪线段信息
         self.current_segment_idx = 0
         self.segment_count = len(self.Pm) - 1 if not self.closed else len(self.Pm)
@@ -378,6 +384,13 @@ class Env:
         self.angular_acc = 0.0  # 当前角加速度
         self.angular_jerk = 0.0  # 当前角加加速度
         
+        # 重置累积进度跟踪变量
+        self.completed_laps = 0
+        self.cumulative_progress = 0.0
+        self.local_progress = 0.0
+        self.path_completed = False
+        self.last_progress = 0.0
+        
         self.state = np.array([
             0.0,  # 初始theta_prime
             0.0,  # 初始length_prime
@@ -492,6 +505,10 @@ class Env:
         # 更新线段信息
         self.current_segment_idx, distance_to_next_turn = self._update_segment_info()
         overall_progress = self._calculate_path_progress(self.current_position)
+        
+        # 更新进度跟踪（在闭合路径的进度计算之后）
+        self.last_progress = self.local_progress if self.closed else overall_progress
+        
         # 计算下一个转折点夹角
         next_angle = self._get_next_angle(self.current_segment_idx)
 
@@ -826,7 +843,7 @@ class Env:
         return 0.0
         
     def _calculate_path_progress(self, pt):
-        """修复的路径进度计算"""
+        """修复的路径进度计算，支持闭合路径的累积进度跟踪"""
         n = len(self.Pm)
         total_length = self.cache['total_path_length'] or 1.0
         
@@ -860,11 +877,32 @@ class Env:
             
             progress = current_dist / total_length
             
-            # 闭合路径特殊处理：确保进度不超过1
             if self.closed:
-                progress = min(progress, 1.0)
-            
-            return progress
+                # 闭合路径累积进度处理
+                self.local_progress = progress
+                
+                # 检测是否完成了一圈（从接近1.0回到接近0.0）
+                if self.last_progress > 0.95 and progress < 0.1:
+                    self.completed_laps += 1
+                    self.cumulative_progress += 1.0  # 加上完整一圈的进度
+                    
+                    # 如果这是第一圈完成，标记路径完成
+                    if self.completed_laps >= 1:
+                        self.path_completed = True
+                
+                # 更新累积进度（当前圈数 + 本圈进度）
+                current_cumulative = self.completed_laps + progress
+                self.cumulative_progress = current_cumulative
+                
+                # 为了兼容性，返回累积进度，但限制在合理范围内
+                # 对于已完成的闭合路径，返回略大于1.0的值以便检测完成
+                if self.path_completed:
+                    return min(current_cumulative, 1.001)  # 稍微超过1.0表示完成
+                else:
+                    return min(progress, 1.0)  # 第一圈期间返回本地进度
+            else:
+                # 非闭合路径保持原有逻辑
+                return progress
         
         return 0.0
     
@@ -1067,13 +1105,18 @@ class Env:
         if contour_error > self.epsilon or self.current_step >= self.max_steps:
             return True
         
-        # 闭合路径完成检查
-        if self.closed and self.state[4] > 0.999:
-            return True
-        
-        # 非闭合路径完成检查
-        if not self.closed and self.state[4] > 0.999:
-            return True
+        # 闭合路径完成检查 - 使用新的累积进度跟踪
+        if self.closed:
+            # 检查是否已完成一整圈
+            if self.path_completed:
+                return True
+            # 备用检查：如果progress超过1.0也认为完成
+            if self.state[4] > 1.0:
+                return True
+        else:
+            # 非闭合路径完成检查
+            if self.state[4] > 0.999:
+                return True
         
         return False
    
