@@ -492,6 +492,10 @@ class Env:
         # 更新线段信息
         self.current_segment_idx, distance_to_next_turn = self._update_segment_info()
         overall_progress = self._calculate_path_progress(self.current_position)
+        
+        # 更新进度跟踪（用于单调性约束）
+        self.last_progress = overall_progress
+        
         # 计算下一个转折点夹角
         next_angle = self._get_next_angle(self.current_segment_idx)
 
@@ -826,47 +830,62 @@ class Env:
         return 0.0
         
     def _calculate_path_progress(self, pt):
-        """修复的路径进度计算"""
+        """改进的路径进度计算，支持单调性约束"""
         n = len(self.Pm)
         total_length = self.cache['total_path_length'] or 1.0
         
         # 找到当前所在线段
         segment_index = self._find_containing_segment(pt)
+        
         if segment_index >= 0:
             current_dist = 0.0
             
-            # 累加之前所有线段长度
-            for i in range(segment_index):
-                current_dist += self.cache['segment_lengths'][i]
-            
-            # 计算在当前线段上的进度
-            if self.closed and segment_index == len(self.Pm) - 1:
-                # 闭合路径的最后一段（连接到起点）
-                p1 = np.array(self.Pm[-1])
-                p2 = np.array(self.Pm[0])
+            # 特殊处理闭合路径的最后一段
+            if self.closed and segment_index == len(self.cache['segment_lengths']) - 1:
+                # 这是连接终点到起点的线段
+                for i in range(len(self.cache['segment_lengths']) - 1):
+                    current_dist += self.cache['segment_lengths'][i]
+                
+                # 计算在最后一段的进度
+                p1 = np.array(self.Pm[-2])  # 倒数第二个点
+                p2 = np.array(self.Pm[0])   # 起点（也是终点）
+                
+                seg_vec = p2 - p1
+                pt_vec = pt - p1
+                seg_length = np.linalg.norm(seg_vec)
+                
+                if seg_length > 1e-6:
+                    t = np.clip(np.dot(pt_vec, seg_vec) / (seg_length ** 2), 0, 1)
+                    segment_progress = t * seg_length
+                    current_dist += segment_progress
             else:
+                # 正常线段处理
+                for i in range(segment_index):
+                    current_dist += self.cache['segment_lengths'][i]
+                
+                # 计算在当前线段上的进度
                 p1 = np.array(self.Pm[segment_index])
                 p2 = np.array(self.Pm[segment_index + 1])
-            
-            # 投影到线段上
-            seg_vec = p2 - p1
-            pt_vec = pt - p1
-            seg_length = np.linalg.norm(seg_vec)
-            
-            if seg_length > 1e-6:
-                t = np.clip(np.dot(pt_vec, seg_vec) / (seg_length ** 2), 0, 1)
-                segment_progress = t * seg_length
-                current_dist += segment_progress
+                
+                seg_vec = p2 - p1
+                pt_vec = pt - p1
+                seg_length = np.linalg.norm(seg_vec)
+                
+                if seg_length > 1e-6:
+                    t = np.clip(np.dot(pt_vec, seg_vec) / (seg_length ** 2), 0, 1)
+                    segment_progress = t * seg_length
+                    current_dist += segment_progress
             
             progress = current_dist / total_length
             
-            # 闭合路径特殊处理：确保进度不超过1
-            if self.closed:
-                progress = min(progress, 1.0)
+            # 单调性约束：确保进度不会倒退（除非重置）
+            if hasattr(self, 'last_progress') and progress < self.last_progress - 0.1:
+                # 如果进度大幅倒退，保持上一次的进度
+                progress = self.last_progress
             
-            return progress
+            return min(progress, 1.0)  # 确保不超过100%
         
-        return 0.0
+        return getattr(self, 'last_progress', 0.0)
     
     def _create_polygons(self):
         polygons = []
@@ -895,12 +914,25 @@ class Env:
         return self._traditional_shortest_distance(pt)
  
     def _find_containing_segment(self, pt):
-        """使用 R-tree 加速查询"""
+        """改进的线段查找，特别处理闭合路径"""
         x, y = pt
         candidate_idxs = list(self.rtree_idx.intersection((x, y, x, y)))
         
-        # 先检查当前线段
-        if self.current_segment_idx in candidate_idxs:
+        # 对于闭合路径，需要特殊处理终点附近的情况
+        if self.closed:
+            start_point = np.array(self.Pm[0])
+            distance_to_start = np.linalg.norm(pt - start_point)
+            
+            # 如果非常接近起点，且当前进度较高，说明接近完成
+            if (distance_to_start < self.epsilon * 0.3 and 
+                hasattr(self, 'last_progress') and 
+                getattr(self, 'last_progress', 0) > 0.8):
+                # 返回最后一段的索引
+                return len(self.cache['segment_lengths']) - 1
+        
+        # 优先检查当前线段
+        if (hasattr(self, 'current_segment_idx') and 
+            self.current_segment_idx in candidate_idxs):
             polygon = self.cache['polygons'][self.current_segment_idx]
             if polygon and self.is_point_in_polygon((x,y), polygon):
                 return self.current_segment_idx
@@ -1067,12 +1099,23 @@ class Env:
         if contour_error > self.epsilon or self.current_step >= self.max_steps:
             return True
         
-        # 闭合路径完成检查
-        if self.closed and self.state[4] > 0.999:
-            return True
+        # 闭合路径完成检查 - 更严格的条件
+        if self.closed:
+            # 检查是否接近起点/终点
+            start_point = np.array(self.Pm[0])
+            distance_to_start = np.linalg.norm(self.current_position - start_point)
+            
+            # 同时满足三个条件才算完成：
+            # 1. 进度超过95%
+            # 2. 距离起点很近
+            # 3. 轮廓误差在允许范围内
+            if (self.state[4] > 0.95 and 
+                distance_to_start < self.epsilon * 0.5 and 
+                contour_error < self.epsilon * 0.8):
+                return True
         
         # 非闭合路径完成检查
-        if not self.closed and self.state[4] > 0.999:
+        if not self.closed and self.state[4] > 0.99:
             return True
         
         return False
